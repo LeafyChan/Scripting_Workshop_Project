@@ -49,10 +49,11 @@ storage_commit() {
         local header
     header=$(head -n 1 "$csv_file")
 
-    if [ "$header" != "IP,MAC,VENDOR,PORTS,SERVICES,TIMESTAMP" ]; then
-        echo "Error: Invalid CSV header" >&2
-        return 1
+    if [ "$header" != "IP,MAC,VENDOR,PORTS,SERVICES,TIMESTAMP,HOSTNAME" ]; then
+       echo "Error: Invalid CSV header" >&2
+       return 1
     fi
+
         local snapshot_hash
     snapshot_hash=$(sha1sum "$csv_file" | awk '{print $1}')
 
@@ -81,12 +82,15 @@ storage_commit() {
     local hosts
     hosts=$(tail -n +2 "$csv_file" | wc -l)
 
+
     local commit_data
-    commit_data="blob=$snapshot_hash
-parent=$parent
-timestamp=$timestamp
-message=$message
-hosts=$hosts"
+
+    commit_data=$(printf 'blob=%s\nparent=%s\ntimestamp=%s\nmessage=%s\nhosts=%s' \
+        "$snapshot_hash" \
+        "$parent" \
+        "$timestamp" \
+        "$message" \
+        "$hosts")
 
     local commit_hash
     commit_hash=$(printf '%s' "$commit_data" | sha1sum | awk '{print $1}')
@@ -266,10 +270,10 @@ storage_list() {
         local hosts
         local parent
 
-        timestamp=$(grep 'timestamp=' "$commit_file" | cut -d'=' -f2- | xargs)
-        message=$(grep 'message=' "$commit_file" | cut -d'=' -f2- | xargs)
-        hosts=$(grep 'hosts=' "$commit_file" | cut -d'=' -f2- | xargs)
-        parent=$(grep 'parent=' "$commit_file" | cut -d'=' -f2- | xargs)
+       timestamp=$(grep '^timestamp=' "$commit_file" | cut -d'=' -f2-)
+       message=$(grep '^message=' "$commit_file" | cut -d'=' -f2-)
+       hosts=$(grep '^hosts=' "$commit_file" | cut -d'=' -f2-)
+       parent=$(grep '^parent=' "$commit_file" | cut -d'=' -f2-)
 
         if [ -z "$parent" ]; then
             parent="none"
