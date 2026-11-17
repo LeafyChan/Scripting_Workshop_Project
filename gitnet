@@ -1,1 +1,565 @@
 #!/usr/bin/env bash
+
+GITNET_VERSION="1.0.0"
+GITNET_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GITNET_SELF="${GITNET_ROOT}/$(basename "${BASH_SOURCE[0]}")"
+GITNET_DIR=".gitnet"
+export GITNET_DIR
+GITNET_LOCK_DIR_HELD=0
+GITNET_TMP_CSV=""
+
+for gitnet_module in storage scanner engine reporter alerts; do
+    gitnet_module_path="${GITNET_ROOT}/core/${gitnet_module}.sh"
+    if [ ! -f "$gitnet_module_path" ]; then
+        printf 'gitnet: module not found: %s\n' "$gitnet_module_path" >&2
+        exit 1
+    fi
+    source "$gitnet_module_path"
+done
+unset gitnet_module gitnet_module_path
+
+gitnet_die() {
+    printf 'gitnet: %s\n' "$*" >&2
+    exit 1
+}
+
+gitnet_warn() {
+    printf 'gitnet: %s\n' "$*" >&2
+}
+
+gitnet_require_repo() {
+    if [ ! -f "${GITNET_DIR}/HEAD" ] || [ ! -d "${GITNET_DIR}/commits" ]; then
+        gitnet_die "No GitNet repository in ${PWD}. Run 'gitnet init' first."
+    fi
+}
+
+gitnet_require_function() {
+    if ! declare -F "$1" >/dev/null 2>&1; then
+        gitnet_die "Function '$1' is not defined in core/$2.sh"
+    fi
+}
+
+gitnet_commit_field() {
+    awk -F= -v key="$2" '
+        $1 == key { print substr($0, length(key) + 2); exit }
+    ' "${GITNET_DIR}/commits/$1"
+}
+
+gitnet_blob_path() {
+    local blob blob_file
+
+    blob=$(gitnet_commit_field "$1" blob)
+    [ -n "$blob" ] || return 1
+
+    blob_file="${GITNET_DIR}/objects/${blob}.csv"
+    [ -f "$blob_file" ] || return 1
+
+    printf '%s\n' "$blob_file"
+}
+
+gitnet_config_key_ok() {
+    case "$1" in
+        interface|subnet|alert_email|port_list|probe_threshold) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+gitnet_config_get() {
+    [ -f "${GITNET_DIR}/config" ] || return 0
+
+    awk -F= -v key="$1" '
+        /^[[:space:]]*#/ { next }
+        $1 == key { print substr($0, length(key) + 2); exit }
+    ' "${GITNET_DIR}/config"
+}
+
+gitnet_config_set() {
+    local tmp_file
+
+    tmp_file=$(mktemp) || return 1
+
+    awk -F= -v key="$1" -v value="$2" '
+        BEGIN { OFS = "=" }
+        $1 == key { print key, value; found = 1; next }
+        { print }
+        END { if (!found) print key, value }
+    ' "${GITNET_DIR}/config" > "$tmp_file" && cat "$tmp_file" > "${GITNET_DIR}/config"
+
+    rm -f "$tmp_file"
+}
+
+gitnet_lock_acquire() {
+    local waited=0
+
+    if command -v flock >/dev/null 2>&1; then
+        exec 200>"${GITNET_DIR}/lockfile" || return 1
+        flock -x -w 10 200
+        return $?
+    fi
+
+    while ! mkdir "${GITNET_DIR}/lockdir" 2>/dev/null; do
+        waited=$((waited + 1))
+        [ "$waited" -le 10 ] || return 1
+        sleep 1
+    done
+
+    GITNET_LOCK_DIR_HELD=1
+    return 0
+}
+
+gitnet_cleanup() {
+    if [ "$GITNET_LOCK_DIR_HELD" -eq 1 ]; then
+        rmdir "${GITNET_DIR}/lockdir" 2>/dev/null
+        GITNET_LOCK_DIR_HELD=0
+    fi
+
+    if [ -n "$GITNET_TMP_CSV" ]; then
+        rm -f "$GITNET_TMP_CSV"
+    fi
+}
+
+gitnet_open_file() {
+    if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$1" >/dev/null 2>&1
+    elif command -v wslview >/dev/null 2>&1; then
+        wslview "$1"
+    elif command -v open >/dev/null 2>&1; then
+        open "$1"
+    else
+        gitnet_warn "No program found to open $1"
+    fi
+}
+
+cmd_init() {
+    storage_init || gitnet_die "Initialisation failed"
+    printf 'GitNet repository ready in %s/%s\n' "$PWD" "$GITNET_DIR"
+}
+
+cmd_scan() {
+    local message="Auto scan" iface="" subnet="" quiet=0
+    local old_commit new_commit old_blob new_blob raw_diff health stamp
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -m|--message)
+                [ $# -ge 2 ] || gitnet_die "Option $1 needs a value"
+                message="$2"
+                shift 2
+                ;;
+            -i|--interface)
+                [ $# -ge 2 ] || gitnet_die "Option $1 needs a value"
+                iface="$2"
+                shift 2
+                ;;
+            -s|--subnet)
+                [ $# -ge 2 ] || gitnet_die "Option $1 needs a value"
+                subnet="$2"
+                shift 2
+                ;;
+            -q|--quiet)
+                quiet=1
+                shift
+                ;;
+            *)
+                gitnet_die "Unknown option for scan: $1"
+                ;;
+        esac
+    done
+
+    gitnet_require_repo
+    gitnet_require_function run_scan scanner
+    gitnet_require_function storage_commit storage
+
+    message=$(printf '%s' "$message" | tr '\r\n' '  ')
+
+    if [ "$quiet" -eq 1 ]; then
+        exec >/dev/null 2>>"${GITNET_DIR}/logs/scan.log"
+    fi
+
+    trap gitnet_cleanup EXIT
+    trap 'rm -f "${GITNET_TMP_CSV}.partial.$$"; exit 130' INT TERM
+
+    gitnet_lock_acquire || gitnet_die "Another scan is running. Waited 10 seconds."
+
+    GITNET_TMP_CSV="${GITNET_DIR}/tmp/scan_$$.csv"
+    old_commit=$(cat "${GITNET_DIR}/HEAD")
+    [ -n "$old_commit" ] || old_commit="none"
+
+    run_scan "$iface" "$subnet" "$GITNET_TMP_CSV" || gitnet_die "Scan failed. No commit was created."
+
+    if ! new_commit=$(storage_commit "$GITNET_TMP_CSV" "$message") || [ -z "$new_commit" ]; then
+        gitnet_die "Commit failed. The scan result was not stored."
+    fi
+
+    stamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    if declare -F report_system_health >/dev/null 2>&1; then
+        health=$(report_system_health 2>/dev/null)
+        printf '%s | %s | %s\n' "$stamp" "${new_commit:0:8}" "$health" >> "${GITNET_DIR}/logs/health.log"
+    fi
+
+    printf 'Committed %s  %s\n' "${new_commit:0:8}" "$message"
+
+    if [ "$old_commit" = "none" ]; then
+        printf 'First snapshot stored. Nothing to compare yet.\n'
+        return 0
+    fi
+
+    if ! declare -F engine_diff_raw >/dev/null 2>&1 || ! declare -F engine_diff >/dev/null 2>&1; then
+        gitnet_warn "core/engine.sh has no engine_diff_raw or engine_diff. Diff and alerts skipped."
+        return 0
+    fi
+
+    if ! old_blob=$(gitnet_blob_path "$old_commit") || ! new_blob=$(gitnet_blob_path "$new_commit"); then
+        gitnet_warn "A snapshot file is missing. Diff and alerts skipped."
+        return 0
+    fi
+
+    raw_diff=$(engine_diff_raw "$old_blob" "$new_blob")
+    engine_diff "$old_blob" "$new_blob"
+    alerts_process_diff "$raw_diff"
+
+    return 0
+}
+
+cmd_log() {
+    gitnet_require_repo
+    storage_list
+}
+
+cmd_show() {
+    local ref="${1:-HEAD}" commit
+
+    gitnet_require_repo
+    commit=$(storage_resolve_ref "$ref") || exit 1
+
+    printf '%-8s %s\n' \
+        "commit" "$commit" \
+        "parent" "$(gitnet_commit_field "$commit" parent)" \
+        "date" "$(gitnet_commit_field "$commit" timestamp)" \
+        "message" "$(gitnet_commit_field "$commit" message)" \
+        "hosts" "$(gitnet_commit_field "$commit" hosts)"
+    printf '\n'
+
+    if command -v column >/dev/null 2>&1; then
+        storage_get "$commit" | column -t -s','
+    else
+        storage_get "$commit"
+    fi
+}
+
+cmd_diff() {
+    local ref_old="${1:-HEAD~1}" ref_new="${2:-HEAD}"
+    local commit_old commit_new blob_old blob_new status
+
+    [ $# -le 2 ] || gitnet_die "Usage: gitnet diff [old_ref] [new_ref]"
+
+    gitnet_require_repo
+    gitnet_require_function engine_diff engine
+
+    commit_old=$(storage_resolve_ref "$ref_old") || exit 1
+    commit_new=$(storage_resolve_ref "$ref_new") || exit 1
+
+    blob_old=$(gitnet_blob_path "$commit_old") || gitnet_die "Snapshot file missing for commit $commit_old"
+    blob_new=$(gitnet_blob_path "$commit_new") || gitnet_die "Snapshot file missing for commit $commit_new"
+
+    engine_diff "$blob_old" "$blob_new"
+    status=$?
+
+    if [ "$status" -eq 2 ]; then
+        status=0
+    fi
+
+    return "$status"
+}
+
+cmd_report() {
+    local format="html" open_after=0 path=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--format)
+                [ $# -ge 2 ] || gitnet_die "Option $1 needs a value"
+                format="$2"
+                shift 2
+                ;;
+            -o|--open)
+                open_after=1
+                shift
+                ;;
+            *)
+                gitnet_die "Unknown option for report: $1"
+                ;;
+        esac
+    done
+
+    gitnet_require_repo
+
+    case "$format" in
+        html)
+            gitnet_require_function report_html reporter
+            path=$(report_html) || gitnet_die "HTML report failed"
+            ;;
+        csv)
+            gitnet_require_function report_csv reporter
+            path=$(report_csv) || gitnet_die "CSV report failed"
+            ;;
+        dashboard)
+            gitnet_require_function report_dashboard reporter
+            report_dashboard
+            return $?
+            ;;
+        *)
+            gitnet_die "Unknown report format: $format. Use html, csv or dashboard."
+            ;;
+    esac
+
+    printf '%s\n' "$path"
+
+    if [ "$open_after" -eq 1 ]; then
+        gitnet_open_file "$path"
+    fi
+
+    return 0
+}
+
+cmd_schedule() {
+    local interval="" action="install" cron_expr value marker current cron_line
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -i|--interval)
+                [ $# -ge 2 ] || gitnet_die "Option $1 needs a value"
+                interval="$2"
+                shift 2
+                ;;
+            -r|--remove)
+                action="remove"
+                shift
+                ;;
+            -s|--status)
+                action="status"
+                shift
+                ;;
+            *)
+                gitnet_die "Unknown option for schedule: $1"
+                ;;
+        esac
+    done
+
+    command -v crontab >/dev/null 2>&1 || gitnet_die "crontab is not installed"
+    gitnet_require_repo
+
+    marker="#gitnet[${PWD}]"
+    current=$(crontab -l 2>/dev/null)
+
+    case "$action" in
+        status)
+            if printf '%s\n' "$current" | grep -F "$marker"; then
+                return 0
+            fi
+            printf 'No GitNet schedule for %s\n' "$PWD"
+            return 0
+            ;;
+        remove)
+            printf '%s\n' "$current" | grep -vF "$marker" | crontab -
+            printf 'GitNet schedule removed for %s\n' "$PWD"
+            return 0
+            ;;
+    esac
+
+    [ -n "$interval" ] || gitnet_die "Use --interval Nm or --interval Nh"
+
+    if [[ "$interval" =~ ^([0-9]+)m$ ]]; then
+        value="${BASH_REMATCH[1]}"
+        if [ "$value" -lt 1 ] || [ "$value" -gt 59 ]; then
+            gitnet_die "Minutes must be from 1 to 59"
+        fi
+        cron_expr="*/${value} * * * *"
+    elif [[ "$interval" =~ ^([0-9]+)h$ ]]; then
+        value="${BASH_REMATCH[1]}"
+        if [ "$value" -lt 1 ] || [ "$value" -gt 23 ]; then
+            gitnet_die "Hours must be from 1 to 23"
+        fi
+        cron_expr="0 */${value} * * *"
+    else
+        gitnet_die "Interval '$interval' is not valid. Use a number and m or h, for example 30m or 2h."
+    fi
+
+    cron_line="${cron_expr} cd '${PWD}' && '${GITNET_SELF}' scan -q -m 'Auto scan' ${marker}"
+
+    {
+        printf '%s\n' "$current" | grep -vF "$marker"
+        printf '%s\n' "$cron_line"
+    } | crontab -
+
+    printf 'Scheduled: %s\n' "$cron_line"
+
+    if [ "$(id -u)" -ne 0 ]; then
+        gitnet_warn "Scans need root. Run this command with sudo to use the root crontab."
+    fi
+
+    return 0
+}
+
+cmd_alert() {
+    local threshold
+
+    gitnet_require_repo
+
+    case "${1:-}" in
+        -e|--email)
+            [ -n "${2:-}" ] || gitnet_die "Usage: gitnet alert --email address"
+            alerts_set_email "$2"
+            ;;
+        -s|--status)
+            alerts_status "${2:-20}"
+            ;;
+        -p|--probe)
+            threshold=$(gitnet_config_get probe_threshold)
+            [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=5
+            alerts_check_probe_pattern "${2:-60}" "${3:-$threshold}"
+            ;;
+        *)
+            gitnet_die "Usage: gitnet alert --email address | --status [count] | --probe [minutes] [threshold]"
+            ;;
+    esac
+}
+
+cmd_config() {
+    gitnet_require_repo
+
+    case $# in
+        0)
+            cat "${GITNET_DIR}/config"
+            ;;
+        1)
+            gitnet_config_key_ok "$1" || gitnet_die "Unknown key: $1"
+            gitnet_config_get "$1"
+            ;;
+        2)
+            gitnet_config_key_ok "$1" || gitnet_die "Unknown key: $1"
+            gitnet_config_set "$1" "$2"
+            ;;
+        *)
+            gitnet_die "Usage: gitnet config [key [value]]"
+            ;;
+    esac
+}
+
+cmd_status() {
+    local head_commit commit_count object_count alert_count last_stamp last_message
+
+    gitnet_require_repo
+
+    head_commit=$(cat "${GITNET_DIR}/HEAD")
+    commit_count=$(find "${GITNET_DIR}/commits" -type f | wc -l | tr -d ' ')
+    object_count=$(find "${GITNET_DIR}/objects" -type f | wc -l | tr -d ' ')
+    alert_count=0
+    last_stamp="none"
+    last_message="none"
+
+    if [ -f "${GITNET_DIR}/logs/alerts.log" ]; then
+        alert_count=$(wc -l < "${GITNET_DIR}/logs/alerts.log" | tr -d ' ')
+    fi
+
+    if [ -f "${GITNET_DIR}/commits/${head_commit}" ]; then
+        last_stamp=$(gitnet_commit_field "$head_commit" timestamp)
+        last_message=$(gitnet_commit_field "$head_commit" message)
+    fi
+
+    printf '%-14s %s\n' \
+        "Repository" "${PWD}/${GITNET_DIR}" \
+        "HEAD" "${head_commit:0:8}" \
+        "Commits" "$commit_count" \
+        "Snapshots" "$object_count" \
+        "Last scan" "$last_stamp" \
+        "Last message" "$last_message" \
+        "Alerts logged" "$alert_count" \
+        "Interface" "$(gitnet_config_get interface)" \
+        "Subnet" "$(gitnet_config_get subnet)" \
+        "Alert email" "$(gitnet_config_get alert_email)"
+}
+
+cmd_version() {
+    local tool path
+
+    printf 'GitNet %s\n' "$GITNET_VERSION"
+
+    for tool in nmap arp-scan awk sed grep sudo sha1sum gnuplot mailx mail flock crontab column; do
+        path=$(command -v "$tool" 2>/dev/null)
+        printf '%-10s %s\n' "$tool" "${path:-not installed}"
+    done
+}
+
+cmd_test() {
+    local runner="${GITNET_ROOT}/tests/run_tests.sh"
+
+    [ -f "$runner" ] || gitnet_die "Test runner not found: $runner"
+    bash "$runner" "$@"
+}
+
+cmd_help() {
+    cat <<EOF
+GitNet ${GITNET_VERSION}: version control for network state
+
+Usage: gitnet <command> [options]
+
+Commands:
+  init                          Create the .gitnet repository in the current directory
+  scan [options]                Scan the network and commit the snapshot
+      -m, --message TEXT        Commit message
+      -i, --interface NAME      Network interface to use
+      -s, --subnet CIDR         Subnet to scan, for example 192.168.0.0/24
+      -q, --quiet               Write all output to .gitnet/logs/scan.log
+  log                           Show the commit history
+  show [REF]                    Show one snapshot. REF defaults to HEAD
+  diff [OLD] [NEW]              Compare two snapshots. Defaults to HEAD~1 and HEAD
+  report [options]              Create a report
+      -f, --format FORMAT       html, csv or dashboard. Default is html
+      -o, --open                Open the report file after creation
+  schedule [options]            Manage automatic scans with cron
+      -i, --interval Nm|Nh      Scan every N minutes or N hours
+      -r, --remove              Remove the schedule for this directory
+      -s, --status              Show the schedule for this directory
+  alert [options]               Manage alerts
+      -e, --email ADDRESS       Set the alert email address
+      -s, --status [COUNT]      Show the last COUNT alert log lines
+      -p, --probe [MIN] [NUM]   Check for probe patterns now
+  config [KEY [VALUE]]          Show or change a configuration value
+  status                        Show a summary of the repository
+  version                       Show the version and the installed tools
+  test                          Run the test suite
+  help                          Show this text
+
+References for diff and show: HEAD, HEAD~N, or a commit hash of 6 or more characters.
+EOF
+}
+
+main() {
+    local command="${1:-help}"
+
+    shift || true
+
+    case "$command" in
+        init)               cmd_init "$@" ;;
+        scan)               cmd_scan "$@" ;;
+        log)                cmd_log "$@" ;;
+        show)               cmd_show "$@" ;;
+        diff)               cmd_diff "$@" ;;
+        report)             cmd_report "$@" ;;
+        schedule)           cmd_schedule "$@" ;;
+        alert)              cmd_alert "$@" ;;
+        config)             cmd_config "$@" ;;
+        status)             cmd_status "$@" ;;
+        version|-v|--version) cmd_version ;;
+        test)               cmd_test "$@" ;;
+        help|-h|--help)     cmd_help ;;
+        *)
+            printf "gitnet: unknown command '%s'. Run 'gitnet help'.\n" "$command" >&2
+            return 1
+            ;;
+    esac
+}
+
+main "$@"
