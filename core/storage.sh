@@ -49,7 +49,7 @@ storage_commit() {
         local header
     header=$(head -n 1 "$csv_file")
 
-    if [ "$header" != "IP,MAC,VENDOR,PORTS,SERVICES,TIMESTAMP,HOSTNAME" ]; then
+    if [ "$header" != "IP,MAC_ADDRESS,MAC_VENDOR,OPEN_PORTS,SERVICES,HOSTNAME,TIMESTAMP" ]; then
        echo "Error: Invalid CSV header" >&2
        return 1
     fi
